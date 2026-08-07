@@ -1,203 +1,145 @@
-"""
-Hangman Discord bot.
-- Slash commands: /hangman (start), /guess, /hangman-status, /hangman-stop
-- Words are generated live via Groq API (see groq_words.py), with a local fallback.
-- Runs a tiny Flask server alongside the bot so a free host (Render) can be
-  pinged by an external uptime service to prevent it from spinning down.
-"""
-
 import os
 import threading
-import logging
-
+from flask import Flask, jsonify
 import discord
-from discord import app_commands
 from discord.ext import commands
-from flask import Flask
 
 from game import HangmanGame
 from groq_words import get_random_word
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("hangman-bot")
+# 1. Flask server for Render keep-alive ping
+app = Flask(__name__)
 
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-PORT = int(os.environ.get("PORT", 10000))
-
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# One active game per channel, plus a rolling set of recently used words
-# per channel so Groq doesn't repeat itself too often.
-active_games: dict[int, HangmanGame] = {}
-recent_words: dict[int, set[str]] = {}
-RECENT_WORDS_LIMIT = 25
-
-
-# ---------------------------------------------------------------------------
-# Keep-alive web server (for Render free tier + external uptime pinger)
-# ---------------------------------------------------------------------------
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/")
-@flask_app.route("/health")
-def health():
-    return {
-        "status": "ok",
-        "bot_ready": bot.is_ready(),
-        "active_games": len(active_games),
-    }, 200
-
+@app.route("/")
+@app.route("/health")
+def health_check():
+    return jsonify({"status": "ok"}), 200
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
+# 2. Discord Bot setup with Message Content Intent enabled
+intents = discord.Intents.default()
+intents.message_content = True
 
-# ---------------------------------------------------------------------------
-# Discord bot events & commands
-# ---------------------------------------------------------------------------
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Active games stored per channel ID
+games = {}
+
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
-    try:
-        synced = await bot.tree.sync()
-        log.info("Synced %d slash command(s)", len(synced))
-    except Exception as e:
-        log.exception("Failed to sync commands: %s", e)
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-
-def _build_embed(game: HangmanGame, title: str, color: discord.Color) -> discord.Embed:
-    embed = discord.Embed(title=title, color=color)
-    embed.add_field(name="Word", value=f"`{game.display_word()}`", inline=False)
-    embed.add_field(name="Category", value=game.category.title(), inline=True)
-    embed.add_field(name="Guesses left", value=str(game.remaining_guesses()), inline=True)
-    wrong = ", ".join(sorted(game.wrong_letters)) or "none"
-    embed.add_field(name="Wrong letters", value=wrong, inline=False)
-    embed.description = game.gallows()
-    return embed
-
-
-@bot.tree.command(name="hangman", description="Start a new game of Hangman in this channel")
-async def hangman_start(interaction: discord.Interaction):
-    channel_id = interaction.channel_id
-
-    if channel_id in active_games and not active_games[channel_id].finished:
-        await interaction.response.send_message(
-            "A game is already running in this channel. Use `/guess` to play, "
-            "or `/hangman-stop` to cancel it.",
-            ephemeral=True,
-        )
+@bot.command(name="hangman", aliases=["start"])
+async def start_game(ctx):
+    channel_id = ctx.channel.id
+    if channel_id in games and not games[channel_id].is_over():
+        await ctx.send("A game is already running here! Type a single letter to guess, or `!stop` to end it.")
         return
 
-    await interaction.response.defer()
+    word = get_random_word()
+    games[channel_id] = HangmanGame(word)
+    game = games[channel_id]
 
-    used = recent_words.setdefault(channel_id, set())
-    word, category = get_random_word(recent_words=used)
-    used.add(word)
-    if len(used) > RECENT_WORDS_LIMIT:
-        used.pop()
-
-    game = HangmanGame(word=word, category=category, starter_id=interaction.user.id)
-    active_games[channel_id] = game
-
-    embed = _build_embed(game, "🎯 New Hangman game started!", discord.Color.blurple())
-    embed.set_footer(text=f"Started by {interaction.user.display_name} • Use /guess to play")
-    await interaction.followup.send(embed=embed)
-
-
-@bot.tree.command(name="guess", description="Guess a letter or the whole word")
-@app_commands.describe(letter="A single letter, or the full word if you're feeling confident")
-async def hangman_guess(interaction: discord.Interaction, letter: str):
-    channel_id = interaction.channel_id
-    game = active_games.get(channel_id)
-
-    if not game or game.finished:
-        await interaction.response.send_message(
-            "No active game here. Start one with `/hangman`.", ephemeral=True
-        )
-        return
-
-    guess_text = letter.strip().lower()
-
-    # Whole-word guess
-    if len(guess_text) > 1:
-        if guess_text == game.word:
-            game.guessed_letters.update(set(game.word))
-            game.finished = True
-            game.won = True
-        else:
-            game.wrong_letters.add(guess_text[:1] or "?")
-            if game.wrong_count >= 6:
-                game.finished = True
-                game.won = False
-        status = "correct" if game.won and game.finished else "wrong"
-    elif not guess_text.isalpha():
-        await interaction.response.send_message(
-            "Please guess a single letter (a-z).", ephemeral=True
-        )
-        return
-    else:
-        status = game.guess(guess_text)
-
-    if game.finished:
-        if game.won:
-            embed = _build_embed(game, "🎉 You got it!", discord.Color.green())
-            embed.add_field(name="The word was", value=f"**{game.word}**", inline=False)
-        else:
-            embed = _build_embed(game, "💀 Game over!", discord.Color.red())
-            embed.add_field(name="The word was", value=f"**{game.word}**", inline=False)
-        await interaction.response.send_message(embed=embed)
-        return
-
-    if status == "already":
-        await interaction.response.send_message(
-            f"`{guess_text}` was already guessed.", ephemeral=True
-        )
-        return
-
-    title = "✅ Correct!" if status == "correct" else "❌ Wrong!"
-    color = discord.Color.green() if status == "correct" else discord.Color.orange()
-    embed = _build_embed(game, title, color)
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="hangman-status", description="Show the current game state")
-async def hangman_status(interaction: discord.Interaction):
-    game = active_games.get(interaction.channel_id)
-    if not game or game.finished:
-        await interaction.response.send_message(
-            "No active game here. Start one with `/hangman`.", ephemeral=True
-        )
-        return
-    embed = _build_embed(game, "Current Hangman game", discord.Color.blurple())
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="hangman-stop", description="Cancel the current game in this channel")
-async def hangman_stop(interaction: discord.Interaction):
-    game = active_games.get(interaction.channel_id)
-    if not game or game.finished:
-        await interaction.response.send_message("No active game to cancel.", ephemeral=True)
-        return
-    active_games.pop(interaction.channel_id, None)
-    await interaction.response.send_message(
-        f"Game cancelled. The word was **{game.word}**."
+    embed = discord.Embed(
+        title="🎮 Hangman Started!",
+        description=f"```\n{game.get_ascii()}\n```\n**Word:** `{game.get_display_word()}`\n\n**How to play:** Simply type a single letter in chat (e.g. `e`), or use `!guess <letter>`!",
+        color=discord.Color.blue()
     )
+    await ctx.send(embed=embed)
 
+@bot.command(name="stop")
+async def stop_game(ctx):
+    channel_id = ctx.channel.id
+    if channel_id in games:
+        del games[channel_id]
+        await ctx.send("Game stopped!")
+    else:
+        await ctx.send("No active game in this channel.")
 
-def main():
-    if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
+@bot.command(name="status")
+async def status(ctx):
+    channel_id = ctx.channel.id
+    if channel_id not in games or games[channel_id].is_over():
+        await ctx.send("No active game. Start one with `!hangman`!")
+        return
 
-    # Run Flask in a background thread so Render sees an open port
-    # (required for it to treat this as a live web service) and so an
-    # external uptime pinger has something to hit.
-    threading.Thread(target=run_flask, daemon=True).start()
-    log.info("Keep-alive server listening on port %s", PORT)
+    game = games[channel_id]
+    embed = discord.Embed(
+        title="📊 Hangman Status",
+        description=f"```\n{game.get_ascii()}\n```\n**Word:** `{game.get_display_word()}`\n**Guessed:** `{', '.join(sorted(game.guessed_letters)) or 'None'}`\n**Lives left:** {game.max_attempts - game.wrong_attempts}",
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
 
-    bot.run(DISCORD_TOKEN)
+@bot.command(name="guess")
+async def guess_cmd(ctx, letter: str):
+    await process_guess(ctx.channel, letter)
 
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    # Process prefix commands (!hangman, !stop, !status)
+    await bot.process_commands(message)
+
+    # Ignore prefix commands for raw letter matching
+    if message.content.startswith("!"):
+        return
+
+    # Auto-read single letter messages in active game channels
+    channel_id = message.channel.id
+    if channel_id in games and not games[channel_id].is_over():
+        text = message.content.strip().lower()
+        if len(text) == 1 and text.isalpha():
+            await process_guess(message.channel, text)
+
+async def process_guess(channel, letter: str):
+    channel_id = channel.id
+    if channel_id not in games or games[channel_id].is_over():
+        return
+
+    game = games[channel_id]
+    letter = letter.lower()
+
+    result = game.guess(letter)
+    if result == "already_guessed":
+        await channel.send(f"You already guessed `{letter.upper()}`!")
+        return
+
+    if game.is_won():
+        embed = discord.Embed(
+            title="🎉 You Won!",
+            description=f"```\n{game.get_ascii()}\n```\n**Word:** `{game.word.upper()}`",
+            color=discord.Color.green()
+        )
+        del games[channel_id]
+    elif game.is_lost():
+        embed = discord.Embed(
+            title="💀 Game Over!",
+            description=f"```\n{game.get_ascii()}\n```\n**The word was:** `{game.word.upper()}`",
+            color=discord.Color.red()
+        )
+        del games[channel_id]
+    else:
+        color = discord.Color.green() if result == "correct" else discord.Color.orange()
+        embed = discord.Embed(
+            title="Correct!" if result == "correct" else "Wrong guess!",
+            description=f"```\n{game.get_ascii()}\n```\n**Word:** `{game.get_display_word()}`\n**Guessed:** `{', '.join(sorted(game.guessed_letters))}`",
+            color=color
+        )
+
+    await channel.send(embed=embed)
 
 if __name__ == "__main__":
-    main()
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
+
+    token = os.environ.get("DISCORD_TOKEN")
+    if token:
+        bot.run(token)
+    else:
+        print("Error: DISCORD_TOKEN environment variable not set.")
