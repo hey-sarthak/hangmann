@@ -1,0 +1,36 @@
+# NOTE: This file is only used if you deploy via Render's "Blueprint" option
+# (New -> Blueprint). If you instead created a plain "Web Service" by hand in
+# the dashboard, Render does NOT read this file - use it purely as a
+# reference for the settings to type in manually:
+#
+#   Environment:      Python 3
+#   Build Command:    pip install -r requirements.txt
+#   Start Command:    python bot.py
+#   Instance Type:    Free
+#   Env vars:
+#     DISCORD_TOKEN   -> your bot token
+#     GROQ_API_KEY    -> your Groq key
+#     GROQ_MODEL      -> llama-3.3-70b-versatile
+#     PYTHON_VERSION  -> 3.11.9
+#
+# Keep-alive: the free plan spins down after ~15 min idle. Use a free
+# external pinger (cron-job.org, UptimeRobot) hitting
+# https://<your-app>.onrender.com/health every 5-10 minutes - see README.md.
+# Render's own Cron Job service type is a paid feature, so it's not used here.
+
+services:
+  - type: web
+    name: hangman-discord-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: PYTHON_VERSION
+        value: 3.11.9
